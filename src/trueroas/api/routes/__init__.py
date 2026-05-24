@@ -1,0 +1,1 @@
+from src.trueroas.api.routes.metrics import router as metrics_router

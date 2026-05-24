@@ -1,0 +1,19 @@
+- id: R01
+  name: "Zero Purchase Spend"
+  condition: "pl.col('spend') > 0 & pl.col('purchases') == 0"
+  weight: 10
+
+- id: R07
+  name: "High Frequency Fatigue"
+  condition: "pl.col('frequency') > 5 & pl.col('ctr') < 0.005"
+  weight: 8
+
+- id: R12
+  name: "View-through Inflation"
+  condition: "pl.col('view_through_share') > 0.6"
+  weight: 7
+
+- id: R18
+  name: "CAPI Coverage Low"
+  condition: "pl.col('capi_coverage') < 0.7"
+  weight: 9

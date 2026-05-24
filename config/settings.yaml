@@ -1,0 +1,14 @@
+timezone: "Asia/Ulaanbaatar"
+currency_base: "USD"
+attribution_default: "7d_click_1d_view"
+meta_api_version: "v19.0"
+paths:
+  raw: "data/raw"
+  clean: "data/clean"
+  warehouse: "data/warehouse.duckdb"
+
+recon_variance_threshold: 0.10
+recon_critical_variance_threshold: 0.20
+recon_consecutive_weeks: 2
+stitch_confidence_floor: 0.1
+stitch_confidence_ceiling: 0.9
