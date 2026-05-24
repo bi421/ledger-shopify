@@ -2,6 +2,7 @@ import pytest
 import polars as pl
 import json
 import os
+from datetime import datetime
 from src.trueroas.warehouse.warehouse import TrueRoasWarehouse
 
 @pytest.fixture
@@ -81,3 +82,38 @@ def test_fetch_audit_logs_empty_result(test_warehouse):
     logs = test_warehouse.fetch_audit_logs("non_existent_account")
     assert logs.height == 0
     assert isinstance(logs, pl.DataFrame)
+
+def test_action_json_serialization_and_zombie_reconciliation(test_warehouse):
+    """Verify action payloads serialize safely and stale EXECUTING actions reconcile."""
+    action_id = "action_zombie_1"
+    test_warehouse.log_action(
+        action_id=action_id,
+        idempotency_key="idem_zombie_1",
+        account_id="act_zombie",
+        org_id="org_zombie",
+        action_type="SCALE_BUDGET",
+        params={"scheduled_at": datetime(2026, 5, 24, 10, 0, 0)},
+        status="EXECUTING",
+        summary={"nested": {"ok": True}},
+        audit_ref="audit_zombie",
+        grade="A",
+        score=0.95,
+    )
+
+    with test_warehouse._get_connection(read_only=False) as conn:
+        conn.execute(
+            "UPDATE actions SET timestamp = now() - INTERVAL '6 minutes' WHERE action_id = ?",
+            [action_id],
+        )
+
+    zombies = test_warehouse.get_zombie_actions(max_age_minutes=5)
+    assert [z["action_id"] for z in zombies] == [action_id]
+    assert zombies[0]["params"]["scheduled_at"] == "2026-05-24T10:00:00"
+
+    result = test_warehouse.reconcile_zombie_actions(
+        confirmed_action_ids=[action_id],
+        max_age_minutes=5,
+    )
+
+    assert result == {"executed": 1, "failed": 0}
+    assert test_warehouse.get_action_by_idempotency("idem_zombie_1")["status"] == "EXECUTED"

@@ -7,6 +7,18 @@ import duckdb
 import polars as pl
 from typing import Optional, Any, Dict, List
 
+
+def _json_default(value: Any):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, default=_json_default)
+
 class TrueRoasWarehouse:
     """
     Manages the analytical storage layer using DuckDB. Handles local 
@@ -179,7 +191,7 @@ class TrueRoasWarehouse:
             conn.execute("""
                 INSERT INTO actions (action_id, idempotency_key, account_id, org_id, timestamp, action_type, action_params, status, context_summary, audit_ref, truth_grade, trust_score, approver_id)
                 VALUES (?, ?, ?, ?, now(), ?, ?, ?, ?, ?, ?, ?, NULL)
-            """, [action_id, idempotency_key, account_id, org_id, action_type, json.dumps(params), status, json.dumps(summary), audit_ref, grade, score])
+            """, [action_id, idempotency_key, account_id, org_id, action_type, _json_dumps(params), status, _json_dumps(summary), audit_ref, grade, score])
 
     def update_action_status(self, action_id: str, status: str, approver_id: Optional[str] = None):
         with self._get_connection(read_only=False) as conn:
@@ -206,6 +218,62 @@ class TrueRoasWarehouse:
         with self._get_connection(read_only=True) as conn:
             res = conn.execute("SELECT action_id, status FROM actions WHERE idempotency_key = ?", [idempotency_key]).fetchone()
             return {"action_id": res[0], "status": res[1]} if res else None
+
+    def get_zombie_actions(self, max_age_minutes: int = 5) -> List[Dict[str, Any]]:
+        with self._get_connection(read_only=True) as conn:
+            rows = conn.execute("""
+                SELECT action_id, account_id, org_id, action_type, action_params, timestamp
+                FROM actions
+                WHERE status = 'EXECUTING' AND timestamp <= now() - (? * INTERVAL '1 minute')
+                ORDER BY timestamp ASC
+            """, [max_age_minutes]).fetchall()
+            return [
+                {
+                    "action_id": row[0],
+                    "account_id": row[1],
+                    "org_id": row[2],
+                    "action_type": row[3],
+                    "params": json.loads(row[4]) if row[4] else {},
+                    "timestamp": row[5],
+                }
+                for row in rows
+            ]
+
+    def reconcile_zombie_actions(
+        self,
+        confirmed_action_ids: Optional[List[str]] = None,
+        max_age_minutes: int = 5,
+    ) -> Dict[str, int]:
+        """
+        Resolves EXECUTING actions older than the reconciliation window.
+        Confirmed actions become EXECUTED; unconfirmed stale actions become FAILED.
+        """
+        confirmed = set(confirmed_action_ids or [])
+        zombies = self.get_zombie_actions(max_age_minutes=max_age_minutes)
+        resolved = {"executed": 0, "failed": 0}
+
+        with self._get_connection(read_only=False) as conn:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                for action in zombies:
+                    if action["action_id"] in confirmed:
+                        conn.execute(
+                            "UPDATE actions SET status = 'EXECUTED', timestamp = now() WHERE action_id = ?",
+                            [action["action_id"]],
+                        )
+                        resolved["executed"] += 1
+                    else:
+                        conn.execute(
+                            "UPDATE actions SET status = 'FAILED', timestamp = now() WHERE action_id = ?",
+                            [action["action_id"]],
+                        )
+                        resolved["failed"] += 1
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        return resolved
 
     def get_latest_audit(self, account_id: str) -> Optional[Dict[str, Any]]:
         with self._get_connection(read_only=True) as conn:
@@ -249,7 +317,7 @@ class TrueRoasWarehouse:
                 conn.execute("""
                     INSERT INTO dead_letter_queue (id, job_id, account_id, failed_at, payload_snapshot, error_context)
                     VALUES (?, ?, ?, now(), ?, ?)
-                """, [str(uuid.uuid4()), job_id, account_id, json.dumps(payload), error])
+                """, [str(uuid.uuid4()), job_id, account_id, _json_dumps(payload), error])
                 
                 conn.execute("UPDATE sync_jobs SET status = 'FAILED', error_log = ?, end_timestamp = now() WHERE job_id = ?", 
                              [error, job_id])
@@ -359,7 +427,7 @@ class TrueRoasWarehouse:
 
                 if metadata:
                     account_id = metadata.get("account_id", "unknown")
-                    diag_json = json.dumps(metadata)
+                    diag_json = _json_dumps(metadata)
                     connection.execute("""
                         INSERT INTO audit_logs (account_id, execution_timestamp, trace_id, diagnostics) 
                         VALUES (?, now(), ?, ?)
@@ -389,7 +457,7 @@ class TrueRoasWarehouse:
                 audit_id,
                 reasoning.get("recommended_action"),
                 reasoning.get("primary_driver") or reasoning.get("suggested_driver"),
-                json.dumps(metrics)
+                _json_dumps(metrics)
             ])
 
     def get_calibration_stats(self, account_id: str) -> float:

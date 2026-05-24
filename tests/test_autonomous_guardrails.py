@@ -159,13 +159,10 @@ async def test_execute_action_three_phase_success(mock_engine):
     assert calls[1].args[1] == "EXECUTED"
 
 @pytest.mark.asyncio
-async def test_execute_action_three_phase_failure(mock_engine):
-    """Verify state machine: EXECUTING -> FAILED on API error."""
+async def test_execute_action_three_phase_zombie_on_final_persistence_failure(mock_engine):
+    """Verify state machine keeps EXECUTING when final persistence fails after external success."""
     mock_engine.warehouse.get_action_by_idempotency.return_value = None
     
-    # Mock Phase 2 Failure
-    # Note: In the actual implementation, you'd mock meta_client.update_budget
-    # For this snippet, we will force an exception in Phase 2
     with patch(
         "src.trueroas.api.routes.autonomous.engine.warehouse.update_action_status",
         side_effect=[None, Exception("API Crash")],
@@ -180,9 +177,27 @@ async def test_execute_action_three_phase_failure(mock_engine):
                 }
             )
 
-    # Check that the status was eventually set to FAILED
-    update_action_status.assert_any_call(pytest.any, "FAILED")
-    assert response.status_code == 502
+    update_action_status.assert_any_call(pytest.any, "EXECUTING")
+    update_action_status.assert_any_call(pytest.any, "EXECUTED")
+    assert response.status_code == 200
+    assert response.json()["status"] == "EXECUTING"
+
+@pytest.mark.asyncio
+async def test_reconcile_zombies_endpoint(mock_engine):
+    mock_engine.warehouse.reconcile_zombie_actions.return_value = {"executed": 1, "failed": 1}
+
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        response = await ac.post(
+            "/api/v1/autonomous/reconcile-zombies",
+            json=["action_confirmed"],
+        )
+
+    assert response.status_code == 200
+    assert response.json()["resolved"] == {"executed": 1, "failed": 1}
+    mock_engine.warehouse.reconcile_zombie_actions.assert_called_once_with(
+        confirmed_action_ids=["action_confirmed"],
+        max_age_minutes=5,
+    )
 
 @pytest.mark.asyncio
 async def test_approve_action_authorization(mock_engine):

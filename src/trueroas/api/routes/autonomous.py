@@ -1,7 +1,9 @@
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Body, HTTPException, Request
 from src.trueroas.schemas import AutonomousActionRequest, AutonomousActionResponse, ApprovalRequest
 from engine import engine
 import uuid
+import logging
+from datetime import datetime, timedelta
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -32,7 +34,6 @@ async def execute_action(request: Request, action: AutonomousActionRequest):
     if not latest_audit:
         raise HTTPException(status_code=422, detail="No historical audit found. Run sync before autonomous execution.")
     
-    from datetime import datetime, timedelta
     if latest_audit["timestamp"] < datetime.now() - timedelta(hours=24):
         job_id = str(uuid.uuid4())
         return AutonomousActionResponse(
@@ -98,11 +99,18 @@ async def execute_action(request: Request, action: AutonomousActionRequest):
             engine.warehouse.update_action_status(action_id, "EXECUTED")
             status = "EXECUTED"
         except Exception as db_err:
-            try:
-                engine.warehouse.update_action_status(action_id, "FAILED")
-            except Exception:
-                pass
-            raise HTTPException(status_code=502, detail=f"Action persistence failure: {db_err}")
+            logging.getLogger("uvicorn.error").critical(
+                "DB WRITE FAILED AFTER API SUCCESS: %s", action_id
+            )
+            return AutonomousActionResponse(
+                action_id=action_id,
+                status="EXECUTING",
+                requires_approval=False,
+                reason=(
+                    "Action may have succeeded externally, but final persistence is delayed. "
+                    "Zombie reconciliation will resolve it within 5 minutes."
+                ),
+            )
 
     return AutonomousActionResponse(
         action_id=action_id,
@@ -131,3 +139,12 @@ async def approve_action(action_id: str, request: ApprovalRequest):
     engine.warehouse.update_action_status(action_id, new_status, request.approver_id)
     
     return {"status": new_status, "action_id": action_id}
+
+
+@router.post("/reconcile-zombies")
+async def reconcile_zombies(confirmed_action_ids: list[str] | None = Body(default=None)):
+    result = engine.warehouse.reconcile_zombie_actions(
+        confirmed_action_ids=confirmed_action_ids or [],
+        max_age_minutes=5,
+    )
+    return {"status": "ok", "resolved": result}
